@@ -21,16 +21,23 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "lsm303agr_reg.h"
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct {
+  void   *hbus;
+  uint8_t i2c_address;
+  GPIO_TypeDef *cs_port;
+  uint16_t cs_pin;
+} sensbus_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define    SENSOR_BUS hspi2
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -39,7 +46,7 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-SPI_HandleTypeDef hspi2;
+ SPI_HandleTypeDef hspi2;
 
 UART_HandleTypeDef huart5;
 
@@ -53,11 +60,32 @@ static void MX_GPIO_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_UART5_Init(void);
 /* USER CODE BEGIN PFP */
-
+// function prototype
+static int32_t platform_write(void *handle, uint8_t reg, const uint8_t *bufp,
+                              uint16_t len);
+static int32_t platform_read(void *handle, uint8_t reg, uint8_t *bufp,
+                             uint16_t len);
+static void platform_delay(uint32_t ms);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static sensbus_t xl_bus  = {&SENSOR_BUS,
+                            0,
+                            CS_A_GPIO_Port,
+                            CS_A_Pin
+                           };
+static sensbus_t mag_bus = {&SENSOR_BUS,
+                            0,
+                            CS_M_GPIO_Port,
+                            CS_M_Pin
+                           };
+
+//variable initialization
+static int16_t data_raw_acceleration[3];
+static float acceleration_mg[3];
+static uint8_t whoamI, rst;
+float pitch, roll;
 
 /* USER CODE END 0 */
 
@@ -93,6 +121,64 @@ int main(void)
   MX_UART5_Init();
   /* USER CODE BEGIN 2 */
 
+  /* Initialize mems driver interface */
+  stmdev_ctx_t dev_ctx_xl;
+  dev_ctx_xl.write_reg = platform_write;
+  dev_ctx_xl.read_reg = platform_read;
+  dev_ctx_xl.handle = (void *)&xl_bus;
+  stmdev_ctx_t dev_ctx_mg;
+  dev_ctx_mg.write_reg = platform_write;
+  dev_ctx_mg.read_reg = platform_read;
+  dev_ctx_mg.handle = (void *)&mag_bus;
+  /* Wait boot time and initialize platform specific hardware */
+  platform_init();
+  /* Wait sensor boot time */
+  platform_delay(BOOT_TIME);
+
+  // set SPI as 3 wire communication
+  lsm303agr_xl_spi_mode_set(&dev_ctx_xl, 1); //1:3wire 0:4wire
+
+  /* Check device ID */
+  whoamI = 0;
+  lsm303agr_xl_device_id_get(&dev_ctx_xl, &whoamI);
+
+  if ( whoamI != LSM303AGR_ID_XL )
+    while (1); /*manage here device not found */
+
+  whoamI = 0;
+  lsm303agr_mag_device_id_get(&dev_ctx_mg, &whoamI);
+
+  if ( whoamI != LSM303AGR_ID_MG )
+    while (1); /*manage here device not found */
+
+  /* Restore default configuration for magnetometer */
+  lsm303agr_mag_reset_set(&dev_ctx_mg, PROPERTY_ENABLE);
+
+  do {
+    lsm303agr_mag_reset_get(&dev_ctx_mg, &rst);
+  } while (rst);
+
+  /* Enable Block Data Update */
+  lsm303agr_xl_block_data_update_set(&dev_ctx_xl, PROPERTY_ENABLE);
+  lsm303agr_mag_block_data_update_set(&dev_ctx_mg, PROPERTY_ENABLE);
+  /* Set Output Data Rate */
+  lsm303agr_xl_data_rate_set(&dev_ctx_xl, LSM303AGR_XL_ODR_1Hz);
+  lsm303agr_mag_data_rate_set(&dev_ctx_mg, LSM303AGR_MG_ODR_10Hz);
+  /* Set accelerometer full scale */
+  lsm303agr_xl_full_scale_set(&dev_ctx_xl, LSM303AGR_2g);
+  /* Set / Reset magnetic sensor mode */
+  lsm303agr_mag_set_rst_mode_set(&dev_ctx_mg,
+                                 LSM303AGR_SENS_OFF_CANC_EVERY_ODR);
+  /* Enable temperature compensation on mag sensor */
+  lsm303agr_mag_offset_temp_comp_set(&dev_ctx_mg, PROPERTY_ENABLE);
+  /* Enable temperature sensor */
+  lsm303agr_temperature_meas_set(&dev_ctx_xl, LSM303AGR_TEMP_ENABLE);
+  /* Set device in continuous mode */
+  lsm303agr_xl_operating_mode_set(&dev_ctx_xl, LSM303AGR_HR_12bit);
+  /* Set magnetometer in continuous mode */
+  lsm303agr_mag_operating_mode_set(&dev_ctx_mg,
+                                   LSM303AGR_CONTINUOUS_MODE);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -102,6 +188,59 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+        /* Read output only if new value is available */
+    lsm303agr_reg_t reg;
+    lsm303agr_xl_status_get(&dev_ctx_xl, &reg.status_reg_a);
+
+    if (reg.status_reg_a.zyxda) {
+      /* Read accelerometer data */
+      memset(data_raw_acceleration, 0x00, 3 * sizeof(int16_t));
+      lsm303agr_acceleration_raw_get(&dev_ctx_xl,
+                                     data_raw_acceleration);
+      acceleration_mg[0] = lsm303agr_from_fs_2g_hr_to_mg(
+                             data_raw_acceleration[0] );
+      acceleration_mg[1] = lsm303agr_from_fs_2g_hr_to_mg(
+                             data_raw_acceleration[1] );
+      acceleration_mg[2] = lsm303agr_from_fs_2g_hr_to_mg(
+                             data_raw_acceleration[2] );
+      sprintf((char *)tx_buffer,
+              "Acceleration [mg]:%4.2f\t%4.2f\t%4.2f\r\n",
+              acceleration_mg[0], acceleration_mg[1], acceleration_mg[2]);
+      tx_com( tx_buffer, strlen( (char const *)tx_buffer ) );
+    }
+
+    lsm303agr_mag_status_get(&dev_ctx_mg, &reg.status_reg_m);
+
+    if (reg.status_reg_m.zyxda) {
+      /* Read magnetic field data */
+      memset(data_raw_magnetic, 0x00, 3 * sizeof(int16_t));
+      lsm303agr_magnetic_raw_get(&dev_ctx_mg, data_raw_magnetic);
+      magnetic_mG[0] = lsm303agr_from_lsb_to_mgauss(
+                         data_raw_magnetic[0]);
+      magnetic_mG[1] = lsm303agr_from_lsb_to_mgauss(
+                         data_raw_magnetic[1]);
+      magnetic_mG[2] = lsm303agr_from_lsb_to_mgauss(
+                         data_raw_magnetic[2]);
+      sprintf((char *)tx_buffer,
+              "Magnetic field [mG]:%4.2f\t%4.2f\t%4.2f\r\n",
+              magnetic_mG[0], magnetic_mG[1], magnetic_mG[2]);
+      tx_com( tx_buffer, strlen( (char const *)tx_buffer ) );
+    }
+
+    lsm303agr_temp_data_ready_get(&dev_ctx_xl, &reg.byte);
+
+    if (reg.byte) {
+      /* Read temperature data */
+      memset(&data_raw_temperature, 0x00, sizeof(int16_t));
+      lsm303agr_temperature_raw_get(&dev_ctx_xl,
+                                    &data_raw_temperature);
+      temperature_degC = lsm303agr_from_lsb_hr_to_celsius(
+                           data_raw_temperature );
+      sprintf((char *)tx_buffer, "Temperature [degC]:%6.2f\r\n",
+              temperature_degC );
+      tx_com( tx_buffer, strlen( (char const *)tx_buffer ) );
+    }
+
   }
   /* USER CODE END 3 */
 }
@@ -121,10 +260,12 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
   /** Configure LSE Drive Capability
   */
   HAL_PWR_EnableBkUpAccess();
   __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
@@ -147,6 +288,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
@@ -160,6 +302,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
   /** Enable MSI Auto calibration
   */
   HAL_RCCEx_EnableMSIPLLMode();
@@ -337,6 +480,69 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+/*
+ * @brief  Write generic device register (platform dependent)
+ *
+ * @param  handle    customizable argument. In this examples is used in
+ *                   order to select the correct sensor bus handler.
+ * @param  reg       register to write
+ * @param  bufp      pointer to data to write in register reg
+ * @param  len       number of consecutive register to write
+ *
+ */
+static int32_t platform_write(void *handle, uint8_t reg, const uint8_t *bufp,
+                              uint16_t len)
+{
+	sensbus_t *sensbus = (sensbus_t *)handle;
+	  if (sensbus->cs_pin == CS_A_Pin) {
+	    /* enable auto incremented in multiple read/write commands */
+	    reg |= 0x40;
+	  }
+
+	  HAL_GPIO_WritePin(sensbus->cs_port, sensbus->cs_pin, GPIO_PIN_RESET);
+	  HAL_SPI_Transmit(sensbus->hbus, &reg, 1, 1000);
+	  HAL_SPI_Transmit(sensbus->hbus, (uint8_t*) bufp, len, 1000);
+	  HAL_GPIO_WritePin(sensbus->cs_port, sensbus->cs_pin, GPIO_PIN_SET);  return 0;
+}
+
+/*
+ * @brief  Read generic device register (platform dependent)
+ *
+ * @param  handle    customizable argument. In this examples is used in
+ *                   order to select the correct sensor bus handler.
+ * @param  reg       register to read
+ * @param  bufp      pointer to buffer that store the data read
+ * @param  len       number of consecutive register to read
+ *
+ */
+static int32_t platform_read(void *handle, uint8_t reg, uint8_t *bufp,
+                             uint16_t len)
+{
+	sensbus_t *sensbus = (sensbus_t *)handle;
+	  reg |= 0x80;
+
+	  if (sensbus->cs_pin == CS_A_Pin) {
+	    /* enable auto incremented in multiple read/write commands */
+	    reg |= 0x40;
+	  }
+
+	  HAL_GPIO_WritePin(sensbus->cs_port, sensbus->cs_pin, GPIO_PIN_RESET);
+	  HAL_SPI_Transmit(sensbus->hbus, &reg, 1, 1000);
+	  HAL_SPI_Receive(sensbus->hbus, bufp, len, 1000);
+	  HAL_GPIO_WritePin(sensbus->cs_port, sensbus->cs_pin, GPIO_PIN_SET);
+  return 0;
+}
+
+/*
+ * @brief  platform specific delay (platform dependent)
+ *
+ * @param  ms        delay in ms
+ *
+ */
+static void platform_delay(uint32_t ms)
+{
+  HAL_Delay(ms);
+}
 
 /* USER CODE END 4 */
 
@@ -371,4 +577,3 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
